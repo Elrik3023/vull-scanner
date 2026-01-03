@@ -1,0 +1,26 @@
+# Core dependencies
+langgraph
+langchain-openai
+beautifulsoup4
+lxml
+httpx
+pydantic
+
+# API dependencies (for service deployment)
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+psycopg2-binary
+celery[redis]
+redis
+python-jose[cryptography]  # JWT support
+prometheus-client  # Metrics
+
+# Development/testing dependencies
+pytest
+pytest-cov
+pytest-asyncio
+pytest-mock
+httpx  # Also used for testing
+respx  # For mocking httpx
