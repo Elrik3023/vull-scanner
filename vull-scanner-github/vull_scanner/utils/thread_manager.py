@@ -3,7 +3,7 @@
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from typing import Callable, Any, Iterator
+from typing import Callable, Any, Iterator, Iterable
 from dataclasses import dataclass
 
 
@@ -91,13 +91,6 @@ class AdaptiveThreadPool:
                     old_threads = self.current_threads
                     self.current_threads = new_threads
                     self._last_scale_time = now
-
-                    # Recreate executor with more threads
-                    if self._executor:
-                        old_executor = self._executor
-                        self._executor = ThreadPoolExecutor(max_workers=new_threads)
-                        # Note: old executor will finish its current tasks
-
                     print(f"    [*] Scaling threads: {old_threads} -> {new_threads}")
                     return True
 
@@ -106,8 +99,10 @@ class AdaptiveThreadPool:
     def map_with_progress(
         self,
         fn: Callable[..., Any],
-        items: list[Any],
+        items: Iterable[Any],
         progress_callback: Callable[[int, int], None] | None = None,
+        total_count: int | None = None,
+        expand_tuples: bool = False,
     ) -> Iterator[Any]:
         """Execute function on items with automatic scaling and progress tracking.
 
@@ -122,35 +117,67 @@ class AdaptiveThreadPool:
         if not self._executor:
             raise RuntimeError("ThreadPool must be used as context manager")
 
-        self._total_tasks = len(items)
+        if total_count is None:
+            try:
+                total_count = len(items)  # type: ignore[arg-type]
+            except TypeError:
+                total_count = 0
+
+        self._total_tasks = total_count
         self._completed_count = 0
 
-        # Submit all tasks
-        futures: dict[Future, Any] = {}
-        for item in items:
-            if isinstance(item, tuple):
-                future = self._executor.submit(fn, *item)
-            else:
-                future = self._executor.submit(fn, item)
-            futures[future] = item
+        iterator = iter(items)
 
-        # Process results as they complete
-        for future in as_completed(futures):
-            with self._lock:
-                self._completed_count += 1
-                completed = self._completed_count
+        def submit_item(item: Any) -> Future:
+            if expand_tuples and isinstance(item, tuple):
+                return self._executor.submit(fn, *item)
+            return self._executor.submit(fn, item)
 
-            if progress_callback:
-                progress_callback(completed, self._total_tasks)
+        while True:
+            if self._stop_flag.is_set():
+                break
 
-            # Check if we should scale up
-            self._maybe_scale_up()
+            futures: dict[Future, Any] = {}
+            batch_size = max(self.current_threads * 2, 1)
 
-            try:
-                yield future.result()
-            except Exception as e:
-                # Yield None for failed tasks, let caller handle
-                yield None
+            for _ in range(batch_size):
+                if self._stop_flag.is_set():
+                    break
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    break
+                futures[submit_item(item)] = item
+
+            if not futures:
+                break
+
+            for future in as_completed(futures):
+                if self._stop_flag.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+
+                with self._lock:
+                    self._completed_count += 1
+                    completed = self._completed_count
+
+                if progress_callback and self._total_tasks:
+                    progress_callback(completed, self._total_tasks)
+
+                try:
+                    yield future.result()
+                except Exception:
+                    # Yield None for failed tasks, let caller handle
+                    yield None
+
+            if self._stop_flag.is_set():
+                break
+
+            if self._maybe_scale_up():
+                if self._executor:
+                    self._executor.shutdown(wait=True)
+                    self._executor = ThreadPoolExecutor(max_workers=self.current_threads)
 
     def submit(self, fn: Callable[..., Any], *args, **kwargs) -> Future:
         """Submit a single task to the pool.

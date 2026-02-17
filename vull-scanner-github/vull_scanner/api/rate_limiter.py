@@ -36,6 +36,8 @@ class RateLimiter:
         requests_per_minute: int = 60,
         scans_per_day: int = 100,
         max_concurrent_scans: int = 10,
+        redis_url: str | None = None,
+        redis_key: str = "vull_scanner:concurrent_scans",
     ):
         """Initialize rate limiter.
 
@@ -47,10 +49,32 @@ class RateLimiter:
         self.requests_per_minute = requests_per_minute
         self.scans_per_day = scans_per_day
         self.max_concurrent_scans = max_concurrent_scans
+        self._redis_url = redis_url
+        self._redis_key = redis_key
+        self._redis_client = None
 
         self._state: dict[str, RateLimitState] = defaultdict(RateLimitState)
         self._concurrent_scans = 0
         self._lock = Lock()
+
+    def _get_redis_client(self):
+        if self._redis_client is False:
+            return None
+        if self._redis_client is not None:
+            return self._redis_client
+        if not self._redis_url:
+            self._redis_client = False
+            return None
+        try:
+            import redis
+
+            client = redis.Redis.from_url(self._redis_url)
+            client.ping()
+            self._redis_client = client
+            return client
+        except Exception:
+            self._redis_client = False
+            return None
 
     def _get_key(self, request: Request, api_key_id: Optional[str] = None) -> str:
         """Get rate limit key from request."""
@@ -146,17 +170,26 @@ class RateLimiter:
         Raises:
             HTTPException: If concurrent limit exceeded.
         """
-        with self._lock:
-            if self._concurrent_scans >= self.max_concurrent_scans:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail={
-                        "error": "concurrent_limit_exceeded",
-                        "message": f"Too many concurrent scans. Max {self.max_concurrent_scans} concurrent scans.",
-                        "retry_after": 30,
-                    },
-                    headers={"Retry-After": "30"},
-                )
+        redis_client = self._get_redis_client()
+        if redis_client is not None:
+            try:
+                current = int(redis_client.get(self._redis_key) or 0)
+            except Exception:
+                current = 0
+        else:
+            with self._lock:
+                current = self._concurrent_scans
+
+        if current >= self.max_concurrent_scans:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "error": "concurrent_limit_exceeded",
+                    "message": f"Too many concurrent scans. Max {self.max_concurrent_scans} concurrent scans.",
+                    "retry_after": 30,
+                },
+                headers={"Retry-After": "30"},
+            )
 
     def increment_scan_count(self, request: Request, api_key_id: str) -> None:
         """Increment daily scan count and concurrent scan count.
@@ -169,6 +202,16 @@ class RateLimiter:
             state = self._state[key]
             self._reset_daily_if_needed(state)
             state.daily_scans += 1
+
+        redis_client = self._get_redis_client()
+        if redis_client is not None:
+            try:
+                redis_client.incr(self._redis_key)
+                return
+            except Exception:
+                pass
+
+        with self._lock:
             self._concurrent_scans += 1
 
     def decrement_concurrent_scans(self) -> None:
@@ -176,6 +219,16 @@ class RateLimiter:
 
         Call this when a scan completes or fails.
         """
+        redis_client = self._get_redis_client()
+        if redis_client is not None:
+            try:
+                new_value = redis_client.decr(self._redis_key)
+                if new_value < 0:
+                    redis_client.set(self._redis_key, 0)
+                return
+            except Exception:
+                pass
+
         with self._lock:
             self._concurrent_scans = max(0, self._concurrent_scans - 1)
 
@@ -217,9 +270,10 @@ def get_rate_limiter() -> RateLimiter:
         from vull_scanner.config import get_config
         config = get_config()
         _rate_limiter = RateLimiter(
-            requests_per_minute=config.rate_limit.max_requests_per_minute // 10,  # Per minute from per-minute config
+            requests_per_minute=config.rate_limit.max_requests_per_minute,
             scans_per_day=100,  # Default daily scan limit
             max_concurrent_scans=config.rate_limit.max_concurrent_scans,
+            redis_url=config.redis.url,
         )
     return _rate_limiter
 

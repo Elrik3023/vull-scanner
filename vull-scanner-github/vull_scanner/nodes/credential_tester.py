@@ -4,10 +4,9 @@ import os
 import time
 import httpx
 import threading
+import itertools
 from vull_scanner.state import ScannerState, CredentialTestResult, LoginEndpoint
 from vull_scanner.utils.seclists import (
-    load_usernames,
-    load_passwords,
     load_multiple_wordlists,
     get_wordlists_for_technologies,
     DEFAULT_USERNAMES,
@@ -185,13 +184,15 @@ def _test_endpoint(
 
     print(f"    Form fields: {username_field}={{}}, {password_field}={{...}}")
 
-    # Build credential combinations
-    combinations = [(u, p) for u in usernames for p in passwords]
-    total_combinations = len(combinations)
+    # Build credential combinations lazily to reduce memory usage
+    combinations = itertools.product(usernames, passwords)
+    total_combinations = len(usernames) * len(passwords)
     print(f"    Testing {total_combinations} combinations with adaptive threading...")
 
     # Thread-local HTTP clients
     thread_local = threading.local()
+    clients: list[httpx.Client] = []
+    clients_lock = threading.Lock()
     ssl_verify = get_ssl_verify()
 
     def get_client():
@@ -202,6 +203,8 @@ def _test_endpoint(
                 follow_redirects=False,
                 verify=ssl_verify,
             )
+            with clients_lock:
+                clients.append(thread_local.client)
         return thread_local.client
 
     def test_credential(cred_tuple: tuple[str, str]) -> CredentialTestResult | None:
@@ -238,8 +241,6 @@ def _test_endpoint(
         scale_interval=SCALE_INTERVAL,
     )
 
-    completed = [0]  # Use list for mutable counter in closure
-
     def progress_callback(done: int, total: int):
         """Print progress updates."""
         if done % 50 == 0 or done == total:
@@ -247,7 +248,12 @@ def _test_endpoint(
 
     # Run parallel credential testing
     with AdaptiveThreadPool(config) as pool:
-        for result in pool.map_with_progress(test_credential, combinations, progress_callback):
+        for result in pool.map_with_progress(
+            test_credential,
+            combinations,
+            progress_callback,
+            total_count=total_combinations,
+        ):
             if result is not None:
                 with results_lock:
                     results.append(result)
@@ -256,6 +262,13 @@ def _test_endpoint(
             if found_valid.is_set():
                 pool.stop()
                 break
+
+    with clients_lock:
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     return results, found_valid.is_set()
 

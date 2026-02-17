@@ -164,6 +164,8 @@ def _check_common_login_paths(base_url: str) -> list[LoginEndpoint]:
 
     # Thread-local HTTP clients
     thread_local = threading.local()
+    clients: list[httpx.Client] = []
+    clients_lock = threading.Lock()
 
     def get_client():
         if not hasattr(thread_local, 'client'):
@@ -172,6 +174,8 @@ def _check_common_login_paths(base_url: str) -> list[LoginEndpoint]:
                 follow_redirects=True,
                 verify=False,
             )
+            with clients_lock:
+                clients.append(thread_local.client)
         return thread_local.client
 
     def check_url(url: str) -> list[LoginEndpoint]:
@@ -256,6 +260,13 @@ def _check_common_login_paths(base_url: str) -> list[LoginEndpoint]:
     for result in results:
         if result:
             endpoints.extend(result)
+
+    with clients_lock:
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     return endpoints
 
